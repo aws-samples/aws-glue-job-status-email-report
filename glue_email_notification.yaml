@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+    fromEmail:
+      Type: String
+      Default: 'myemail@amazon.com'
+      Description: 'From Email Address'
+    toEmail:
+      Type: String
+      Default: "['sendmail@amazon.com','sendmail@amazon.com']"
+      Description: 'To Email Address'
+    lookBackHours:
+      Type: Number
+      Default: '24'
+      Description: 'Hours to restrict job run time'
+    htmlTableFormat:
+      Type: String
+      Default: "'<!DOCTYPE html> <html> <head> <style> table { font-family: arial, sans-serif; border-collapse: collapse; width: 100%; } h2 { text-align: center; } h3 { text-align: center; } td, th { border: 1px solid #dceccf; text-align: left; padding: 8px; } tr:nth-child(even) { background-color: #dceccf; } </style> </head> <body> <h2> Glue Job Status (Past 24 Hours) </h2> <h3>'"
+      Description: 'Html table format to keep the CloudFormation size small, do not change this default unless needed'
+    tableHeader:
+      Type: String
+      Default: "'</h3> <table> <tr> <th>Job Name</th> <th>Job State</th> <th>Attempt</th> <th>Started On</th> <th>Completed On</th> <th>Execution Time(Secs)</th> </tr>'"
+      Description: 'Html table header to keep the CloudFormation size small, do not change this default unless needed'
+
+Resources:
+  updateFunctionResources:
+    Type: 'AWS::Lambda::Function'
+    Metadata:
+      Comment:
+        "Fn::Sub":
+          "Glue Job Reporting by {fromEmail}"
+
+    Properties:
+      Environment:
+        Variables:
+          fromEmail: { Ref: fromEmail }
+          toEmail: { Ref: toEmail }
+          lookBackHours: { Ref: lookBackHours }
+          htmlTableFormat: { Ref: htmlTableFormat }
+          tableHeader: { Ref: tableHeader }
+      Code:
+        ZipFile: >
+          import ast
+
+          import boto3
+
+          import os
+
+          from collections import OrderedDict
+
+          from datetime import datetime
+
+          import dateutil.tz
+
+          session = boto3.Session()
+
+          client = session.client('glue')
+
+          runs = []
+
+          J_N = "Job Name"
+
+          JR = "JobRuns"
+
+          JN = "JobName"
+
+          SO = "StartedOn"
+
+          JS = "Job State"
+
+          JRS = "JobRunState"
+
+          AT = "Attempt"
+
+          CO = "CompletedOn"
+
+          ET = "Execution Time"
+
+
+          def get_jb_rn_dtl(jobName, lbh=24):
+              data = client.get_job_runs(JobName=jobName, MaxResults=30)
+              job_runs = []
+              run_count = len(data[JR])
+              if run_count > 0:
+                  for i in range(0, min(26, run_count)):
+                      run = {}
+                      jobName = data[JR][i][JN]
+                      run[JN] = data[JR][i][JN]
+                      try:
+                          if (datetime.now(dateutil.tz.tzlocal()) - data[JR][i][
+                              SO]).total_seconds() > int(lbh) * 60 * 60:
+                              break
+                      except IndexError:
+                          continue
+                      run[SO] = data[JR][i][SO]
+                      run[JRS] = data[JR][i][JRS]
+                      run['Attempt'] = data[JR][i][AT]
+                      try:
+                          run[CO] = data[JR][i][CO]
+                          run[ET] = (run[CO] - run[SO]).seconds
+                      except KeyError:
+                          pass
+
+                      job_runs.append(run)
+              print(job_runs)
+              return job_runs
+
+
+          def get_job_rundetail(job_names, lbh):
+              for job_name in job_names:
+                  run = get_jb_rn_dtl(job_name, lbh)
+                  runs.append(run)
+              return runs
+
+
+          def get_job_names():
+              job_names = client.list_jobs(MaxResults=100)
+              return job_names.get('JobNames')
+
+
+          def publish_in_ses(all_runs, table_html, table_header):
+              lines = []
+
+              for runs in all_runs:
+                  for run in runs:
+                      item = OrderedDict()
+                      item[J_N] = run.get(JN, "")
+                      item[JS] = run.get(JRS, "")
+                      item[AT] = run.get(AT, "")
+                      started_on = str(run.get(SO, "")).split('.')
+                      item[SO] = started_on[0]
+                      completed_on = str(run.get(CO, "")).split('.')
+                      item[CO] = completed_on[0]
+                      execution_time = str(run.get(ET, ""))
+                      item[ET] = execution_time
+                      if len(run) != 0:
+                          lines.append(item)
+
+              html_table = []
+              lines = sorted(lines,
+                             key=lambda i: (i[JS], i[SO], i[CO]))
+              for line in lines:
+                  print(line.keys())
+                  html_table.append("<tr>")
+                  for key in [J_N, JS, AT, SO, CO, 'Execution Time']:
+                      html_table.append(f"<td>{line[key]}</td>")
+                  html_table.append("</tr>")
+              html_table.append("</table></body></html>")
+
+              total_job = len(set(i['Job Name'] for i in lines))
+              count_fail = sum(1 for i in lines if i[JS] == "FAILED")
+              count_running = sum(1 for i in lines if i[JS] == "RUNNING")
+              count_success = sum(1 for i in lines if i[JS] == "SUCCEEDED")
+              count_all = count_fail + count_running + count_success
+
+              subject = f"Number of Jobs {total_job}: Executions {count_all}: Failed {count_fail} Running {count_running} Succeeded {count_success} "
+              table_html_meta = table_html + subject + table_header
+              full_html = table_html_meta + "".join(html_table)
+              print(full_html)
+              return subject, full_html
+
+
+          def main(snd,to_a, lbh, table_html, table_header):
+              job_names = get_job_names()
+              runs = get_job_rundetail(job_names, lbh)
+              subject, html_content = publish_in_ses(runs, table_html, table_header)
+              print(html_content)
+
+              ses = boto3.client('ses')
+
+              response = ses.send_email(
+                  Source=snd,
+                  Destination={
+                      'ToAddresses': ast.literal_eval(to_a)
+                  },
+                  Message={
+                      'Subject': {
+                          'Data': subject,
+                      },
+                      'Body': {
+                          'Html': {
+                              'Data': html_content,
+                          }
+                      }
+                  }
+              )
+              print(response)
+
+
+          def handler(event, context):
+              snd = os.environ['fromEmail']
+              to_a = os.environ['toEmail']
+              look_back_hours = os.environ['lookBackHours']
+              table_html = os.environ['htmlTableFormat']
+              table_header = os.environ['tableHeader']
+              main(snd,to_a, look_back_hours, table_html, table_header)
+
+
+      Description: updateFunctionResources
+      Handler: index.handler
+      Role: !<!GetAtt> LambdaUpdateFunctionResourcesRole.Arn
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 300
+  LambdaUpdateFunctionResourcesRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: ReadWriteFunctions
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: WriteCertificatesConfig
+            Effect: Allow
+            Action:
+              - glue:GetJob
+              - glue:GetJobs
+              - glue:GetJobRun
+              - glue:GetJobRuns
+              - glue:ListJobs
+              - ses:SendEmail
+            Resource: "*"
+Outputs: {}
