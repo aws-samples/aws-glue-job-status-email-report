@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+    fromEmail:
+      Type: String
+      Default: 'myemail@mycompany.com'
+      Description: 'From Email Address'
+    toEmail:
+      Type: String
+      Default: "['sendmail@mycompany.com','sendmail@mycompany.com']"
+      Description: 'To Email Address'
+    s3BucketName:
+      Type: String
+      Default: 'aws-glue-job-status-email-report'
+      Description: 'S3 Bucket Name for lambda function code'
+    s3CodePath:
+      Type: String
+      Default: 'code/glue_job_report_with_cost.zip'
+      Description: 'S3 File path for lambda code'
+    lookBackHours:
+      Type: Number
+      Default: '24'
+      Description: 'Hours to restrict job run time'
+
+Resources:
+  updateFunctionResources:
+    Type: 'AWS::Lambda::Function'
+    Metadata:
+      Comment:
+        "Fn::Sub":
+          "Glue Job Reporting by {fromEmail}"
+
+    Properties:
+      Environment:
+        Variables:
+          fromEmail: { Ref: fromEmail }
+          toEmail: { Ref: toEmail }
+          lookBackHours: { Ref: lookBackHours }
+      Description: updateFunctionResources
+      Handler: glue_job_report_with_cost.handler
+      Role: !<!GetAtt> LambdaUpdateFunctionResourcesRole.Arn
+      Code:
+        S3Bucket: { Ref: s3BucketName }
+        S3Key: { Ref: s3CodePath }
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 600
+  LambdaUpdateFunctionResourcesRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: ReadWriteFunctions
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: WriteCertificatesConfig
+            Effect: Allow
+            Action:
+              - glue:GetJob
+              - glue:GetJobs
+              - glue:GetJobRun
+              - glue:GetJobRuns
+              - glue:ListJobs
+              - ses:SendEmail
+              - ce:GetCostAndUsage
+            Resource: "*"
+Outputs: {}
